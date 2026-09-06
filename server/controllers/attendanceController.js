@@ -1,73 +1,552 @@
 const db = require('../config/db');
 
-// @desc    Mark attendance
-// @route   POST /api/attendance
-// @access  Private (User1 only)
+
+// ======================================================
+// MARK ATTENDANCE
+// POST /api/attendance
+// User1 only
+// ======================================================
+
 const markAttendance = async (req, res) => {
+
     const { employeeId, date, status } = req.body;
 
+    // Check required fields
+    if (!employeeId || !date || !status) {
+        return res.status(400).json({
+            message: 'Employee, date and status are required'
+        });
+    }
+
+    // Validate status
+    const validStatuses = [
+        'present',
+        'absent',
+        'leave'
+    ];
+
+    if (!validStatuses.includes(status.toLowerCase())) {
+        return res.status(400).json({
+            message: 'Invalid attendance status'
+        });
+    }
+
+    // Only User1 can mark attendance
     if (req.user.role !== 'user1') {
-        return res.status(403).json({ message: 'Only User1 can mark attendance' });
+        return res.status(403).json({
+            message: 'Only User1 can mark attendance'
+        });
     }
 
     try {
-        // Validation: Check if employee belongs to user1? 
-        // Requirement says "assigned employees". 
-        // We can enforce that only manager_id = req.user.id can mark.
 
-        const [emp] = await db.query('SELECT * FROM employees WHERE id = ? AND manager_id = ?', [employeeId, req.user.id]);
-        if (emp.length === 0) {
-            return res.status(404).json({ message: 'Employee not found or not assigned to you' });
+        // ------------------------------------------
+        // Check employee belongs to this User1
+        // ------------------------------------------
+
+        const [employees] = await db.query(
+            `
+            SELECT
+                id,
+                name,
+                department,
+                position
+            FROM employees
+            WHERE id = ?
+            AND manager_id = ?
+            `,
+            [
+                employeeId,
+                req.user.id
+            ]
+        );
+
+        if (employees.length === 0) {
+
+            return res.status(404).json({
+                message:
+                    'Employee not found or not assigned to you'
+            });
+
         }
 
-        /* 
-           Using ON DUPLICATE KEY UPDATE to allow updating status for the same day 
-           if marked incorrectly, or we can just insert and fail if exists.
-           Let's allow update for better UX.
-        */
-        await db.query(`
-            INSERT INTO attendance (employee_id, date, status, marked_by)
-            VALUES (?, ?, ?, ?)
-            ON DUPLICATE KEY UPDATE status = VALUES(status), marked_by = VALUES(marked_by), timestamp = CURRENT_TIMESTAMP
-        `, [employeeId, date, status, req.user.id]);
 
-        res.status(201).json({ message: 'Attendance marked successfully' });
+        // ------------------------------------------
+        // Insert / Update attendance
+        // ------------------------------------------
+
+        await db.query(
+            `
+            INSERT INTO attendance
+                (
+                    employee_id,
+                    date,
+                    status,
+                    marked_by
+                )
+            VALUES
+                (?, ?, ?, ?)
+
+            ON DUPLICATE KEY UPDATE
+                status = VALUES(status),
+                marked_by = VALUES(marked_by),
+                timestamp = CURRENT_TIMESTAMP
+            `,
+            [
+                employeeId,
+                date,
+                status.toLowerCase(),
+                req.user.id
+            ]
+        );
+
+
+        // ------------------------------------------
+        // Return updated summary
+        // ------------------------------------------
+
+        const [summary] = await db.query(
+            `
+            SELECT
+
+                SUM(
+                    CASE
+                        WHEN status = 'present'
+                        THEN 1
+                        ELSE 0
+                    END
+                ) AS presentCount,
+
+                SUM(
+                    CASE
+                        WHEN status = 'absent'
+                        THEN 1
+                        ELSE 0
+                    END
+                ) AS absentCount,
+
+                SUM(
+                    CASE
+                        WHEN status = 'leave'
+                        THEN 1
+                        ELSE 0
+                    END
+                ) AS leaveCount
+
+            FROM attendance
+
+            WHERE employee_id = ?
+            `,
+            [employeeId]
+        );
+
+
+        const present =
+            Number(summary[0].presentCount || 0);
+
+        const absent =
+            Number(summary[0].absentCount || 0);
+
+        const leave =
+            Number(summary[0].leaveCount || 0);
+
+
+        // Leave is not counted as a conducted lecture
+        const conducted =
+            present + absent;
+
+
+        const percentage =
+            conducted > 0
+                ? (present / conducted) * 100
+                : 0;
+
+
+        // Next lecture calculations
+
+        const nextLectureAttend =
+            conducted >= 0
+                ? ((present + 1) / (conducted + 1)) * 100
+                : 100;
+
+
+        const nextLectureMiss =
+            conducted >= 0
+                ? (present / (conducted + 1)) * 100
+                : 0;
+
+
+        return res.status(201).json({
+
+            message:
+                'Attendance marked successfully',
+
+            attendance: {
+                employeeId: Number(employeeId),
+                date,
+                status: status.toLowerCase(),
+                markedBy: req.user.id
+            },
+
+            summary: {
+
+                present,
+
+                absent,
+
+                leave,
+
+                conducted,
+
+                percentage:
+                    Number(
+                        percentage.toFixed(2)
+                    ),
+
+                nextLectureAttend:
+                    Number(
+                        nextLectureAttend.toFixed(2)
+                    ),
+
+                nextLectureMiss:
+                    Number(
+                        nextLectureMiss.toFixed(2)
+                    )
+
+            }
+
+        });
+
     } catch (error) {
-        res.status(500).json({ message: error.message });
+
+        console.error(
+            'Mark attendance error:',
+            error.message
+        );
+
+        return res.status(500).json({
+            message: error.message
+        });
+
     }
 };
 
-// @desc    Get attendance records
-// @route   GET /api/attendance
-// @access  Private (Admin & User1)
+
+
+// ======================================================
+// GET ATTENDANCE RECORDS
+// GET /api/attendance
+// ======================================================
+
 const getAttendance = async (req, res) => {
+
     try {
+
         let query = `
-            SELECT a.*, e.name as employee_name, e.department, e.position 
-            FROM attendance a 
-            JOIN employees e ON a.employee_id = e.id
+            SELECT
+                a.id,
+                a.employee_id,
+                a.date,
+                a.status,
+                a.marked_by,
+                a.timestamp,
+
+                e.name AS employee_name,
+                e.department,
+                e.position
+
+            FROM attendance a
+
+            JOIN employees e
+                ON a.employee_id = e.id
         `;
+
         let params = [];
 
-        // Admin sees all. User1 sees only their employees' attendance?
-        // Requirement: "Admin dashboard... attendance records".
-        // "user1 dashboard ... attendance marking feature". 
-        // Doesn't strictly say user1 needs to see history list, but useful to return today's status at least.
+
+        // ------------------------------------------
+        // User1
+        // Can see assigned employees
+        // ------------------------------------------
 
         if (req.user.role === 'user1') {
-            // Maybe just for today? Or all history for their employees?
-            // Let's filter by manager_id for safety.
-            query += ' WHERE e.manager_id = ?';
+
+            query += `
+                WHERE e.manager_id = ?
+            `;
+
             params.push(req.user.id);
+
         }
 
-        query += ' ORDER BY a.date DESC, a.timestamp DESC';
 
-        const [records] = await db.query(query, params);
-        res.json(records);
+        // ------------------------------------------
+        // Employee/User
+        // Can see only own attendance
+        // ------------------------------------------
+
+        else {
+
+            query += `
+                WHERE a.employee_id = ?
+            `;
+
+            params.push(req.user.id);
+
+        }
+
+
+        // ------------------------------------------
+        // Latest attendance first
+        // ------------------------------------------
+
+        query += `
+            ORDER BY
+                a.date DESC,
+                a.timestamp DESC
+        `;
+
+
+        const [records] =
+            await db.query(
+                query,
+                params
+            );
+
+
+        return res.json(records);
+
     } catch (error) {
-        res.status(500).json({ message: error.message });
+
+        console.error(
+            'Get attendance error:',
+            error.message
+        );
+
+        return res.status(500).json({
+            message: error.message
+        });
+
     }
 };
 
-module.exports = { markAttendance, getAttendance };
+
+
+// ======================================================
+// GET ATTENDANCE SUMMARY
+// GET /api/attendance/summary/:employeeId
+// ======================================================
+
+const getAttendanceSummary = async (req, res) => {
+
+    const { employeeId } = req.params;
+
+    try {
+
+        // ------------------------------------------
+        // Check employee access
+        // ------------------------------------------
+
+        if (req.user.role === 'user1') {
+
+            const [employee] =
+                await db.query(
+                    `
+                    SELECT id
+                    FROM employees
+                    WHERE id = ?
+                    AND manager_id = ?
+                    `,
+                    [
+                        employeeId,
+                        req.user.id
+                    ]
+                );
+
+
+            if (employee.length === 0) {
+
+                return res.status(403).json({
+                    message:
+                        'You are not authorized to view this employee'
+                });
+
+            }
+
+        } else {
+
+            // Employee can only see own summary
+
+            if (
+                Number(employeeId) !==
+                Number(req.user.id)
+            ) {
+
+                return res.status(403).json({
+                    message:
+                        'You are not authorized to view this attendance'
+                });
+
+            }
+
+        }
+
+
+        // ------------------------------------------
+        // Get attendance counts
+        // ------------------------------------------
+
+        const [records] =
+            await db.query(
+                `
+                SELECT
+
+                    SUM(
+                        CASE
+                            WHEN status = 'present'
+                            THEN 1
+                            ELSE 0
+                        END
+                    ) AS presentCount,
+
+                    SUM(
+                        CASE
+                            WHEN status = 'absent'
+                            THEN 1
+                            ELSE 0
+                        END
+                    ) AS absentCount,
+
+                    SUM(
+                        CASE
+                            WHEN status = 'leave'
+                            THEN 1
+                            ELSE 0
+                        END
+                    ) AS leaveCount
+
+                FROM attendance
+
+                WHERE employee_id = ?
+                `,
+                [employeeId]
+            );
+
+
+        const present =
+            Number(
+                records[0].presentCount || 0
+            );
+
+
+        const absent =
+            Number(
+                records[0].absentCount || 0
+            );
+
+
+        const leave =
+            Number(
+                records[0].leaveCount || 0
+            );
+
+
+        // ------------------------------------------
+        // Calculate conducted lectures
+        // ------------------------------------------
+
+        const conducted =
+            present + absent;
+
+
+        // ------------------------------------------
+        // Current attendance percentage
+        // ------------------------------------------
+
+        const percentage =
+            conducted > 0
+                ? (present / conducted) * 100
+                : 0;
+
+
+        // ------------------------------------------
+        // If next lecture is attended
+        // ------------------------------------------
+
+        const nextLectureAttend =
+            ((present + 1) /
+                (conducted + 1)) * 100;
+
+
+        // ------------------------------------------
+        // If next lecture is missed
+        // ------------------------------------------
+
+        const nextLectureMiss =
+            (present /
+                (conducted + 1)) * 100;
+
+
+        // ------------------------------------------
+        // Send result
+        // ------------------------------------------
+
+        return res.json({
+
+            employeeId:
+                Number(employeeId),
+
+            present,
+
+            absent,
+
+            leave,
+
+            conducted,
+
+            percentage:
+                Number(
+                    percentage.toFixed(2)
+                ),
+
+            nextLectureAttend:
+                Number(
+                    nextLectureAttend.toFixed(2)
+                ),
+
+            nextLectureMiss:
+                Number(
+                    nextLectureMiss.toFixed(2)
+                )
+
+        });
+
+    } catch (error) {
+
+        console.error(
+            'Attendance summary error:',
+            error.message
+        );
+
+        return res.status(500).json({
+            message: error.message
+        });
+
+    }
+};
+
+
+
+// ======================================================
+// EXPORT
+// ======================================================
+
+module.exports = {
+
+    markAttendance,
+
+    getAttendance,
+
+    getAttendanceSummary
+
+};
